@@ -1,0 +1,162 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseFinder & Normalizer — Prototype</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:900px;margin:20px auto;color:#222}
+textarea,input,button{font-family:inherit}
+#drop{border:2px dashed #bbb;padding:12px;text-align:center;margin-bottom:8px}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ddd;padding:6px;text-align:left}
+.code{background:#f6f6f8;padding:8px;border-radius:4px;white-space:pre-wrap;font-family:monospace}
+.small{font-size:0.9em;color:#555}
+</style>
+</head>
+<body>
+<h1>PoseFinder & Normalizer — Prototype</h1>
+<p class="small">I am Marmalade, and I like tidy data. This demo accepts pasted or dropped CSV/JSON text and shows simple detection and normalization logic. No network crawling in this prototype.</p>
+<label>Paste JSON/CSV content here:</label>
+<div id="drop">Drop a file or click to paste
+<input id="file" type="file" style="display:none" accept=".csv,.json,.zip" />
+</div>
+<textarea id="input" rows="10" style="width:100%" placeholder='Paste CSV or JSON array here...'></textarea>
+<div style="margin-top:8px">
+<button id="analyze">Analyze & Normalize</button>
+</div>
+<h2>Report</h2>
+<div id="report" class="code">No analysis yet.</div>
+<h2>Normalized Output (CSV)</h2>
+<div id="output" class="code">—</div>
+<script>
+const drop = document.getElementById('drop');
+const fileIn = document.getElementById('file');
+const input = document.getElementById('input');
+const report = document.getElementById('report');
+const output = document.getElementById('output');
+const analyze = document.getElementById('analyze');
+
+drop.addEventListener('click', ()=> fileIn.click());
+fileIn.addEventListener('change', handleFiles);
+
+function handleFiles(e){
+  const f = e.target.files[0];
+  if(!f) return;
+  if(f.name.endsWith('.zip')){
+    input.value = '// ZIP files accepted in real tool; not extracted in prototype.\n// Rename file and include contents here.';
+    report.textContent = 'Found ZIP file: ' + f.name + ' — extraction not implemented in prototype.';
+    return;
+  }
+  const r = new FileReader();
+  r.onload = () => input.value = r.result;
+  r.readAsText(f);
+}
+
+function parseInput(text){
+  text = text.trim();
+  if(!text) return {error:'no content'};
+  // Try JSON
+  try{ const j = JSON.parse(text); return {type:'json',data:j}; }catch(e){}
+  // Try CSV (very small parser)
+  const lines = text.split(/\r?\n/).filter(l=>l.trim().length>0);
+  if(lines.length<1) return {error:'empty after splitting'};
+  const headers = lines[0].split(/,|;|\t/).map(h=>h.trim());
+  const rows = lines.slice(1).map(l=>{
+    const cols = l.split(/,|;|\t/);
+    const obj = {}; headers.forEach((h,i)=> obj[h]= (cols[i]!==undefined?cols[i].trim():''));
+    return obj;
+  });
+  return {type:'csv',data:rows,headers:headers};
+}
+
+function guessFields(rows){
+  // rows: array of objects
+  const keys = new Set(); rows.slice(0,50).forEach(r=> Object.keys(r).forEach(k=>keys.add(k)));
+  const candidates = Array.from(keys);
+  const stats = {};
+  candidates.forEach(k=> stats[k]={isNumber:0,isTimestamp:0,samples:[]}})
+}
+
+function isNumberString(s){ if(s===null||s===undefined) return false; return /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(String(s).trim()); }
+function isISOTime(s){ if(!s) return false; return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(s)); }
+
+function analyzeData(parsed){
+  if(parsed.error) return {error:parsed.error};
+  let rows = [];
+  if(parsed.type==='json'){
+    if(Array.isArray(parsed.data)) rows = parsed.data.map(r=>typeof r==='object'?r:{value:r});
+    else return {error:'JSON root is not an array (prototype expects an array of objects)'};
+  } else rows = parsed.data;
+
+  if(rows.length===0) return {error:'no rows found'};
+
+  // gather keys
+  const keys = new Set(); rows.slice(0,200).forEach(r=> Object.keys(r).forEach(k=>keys.add(k)));
+  const klist = Array.from(keys);
+
+  // score fields
+  const scores = {};
+  klist.forEach(k=> scores[k]={nNum:0,nTime:0,nTotal:0}})
+  rows.slice(0,200).forEach(r=>{
+    klist.forEach(k=>{
+      const v = r[k];
+      scores[k].nTotal++;
+      if(isNumberString(v)) scores[k].nNum++;
+      if(isISOTime(v) || (!isNaN(Date.parse(v)) && String(v).length>6)) scores[k].nTime++;
+    });
+  });
+
+  // heuristics
+  const timeFields = klist.filter(k=> scores[k].nTime >= Math.max(1, scores[k].nTotal*0.4));
+  const numericFields = klist.filter(k=> scores[k].nNum >= Math.max(1, scores[k].nTotal*0.6));
+
+  // find position fields among numeric ones
+  const posCandidates = numericFields.filter(k=> /(^|_|\.|\s)(x|y|z|lat|lon|lng|east|north|roll|pitch|yaw|quat)/i.test(k));
+  const reportLines = [];
+  reportLines.push('Rows examined: '+rows.length);
+  reportLines.push('Detected time-like fields: '+(timeFields.length?timeFields.join(', '):'none'));
+  reportLines.push('Detected numeric fields: '+(numericFields.length?numericFields.join(', '):'none'));
+  reportLines.push('Position/orientation candidate fields: '+(posCandidates.length?posCandidates.join(', '):'none'));
+
+  // produce normalized rows: timestamp,x,y,z,roll,pitch,yaw
+  const norm = [];
+  rows.forEach(r=>{
+    const out = {timestamp:'',x:'',y:'',z:'',roll:'',pitch:'',yaw:''};
+    // pick first time field
+    if(timeFields.length){ out.timestamp = r[timeFields[0]]; }
+    // x y z heuristics
+    ['x','y','z'].forEach(ax=>{
+      const k = klist.find(k=> new RegExp(ax+'($|_|\.|\s)','i').test(k) );
+      if(k && isNumberString(r[k])) out[ax]=Number(r[k]);
+    });
+    // fallback: lat/lon -> x/y
+    if((out.x===''||out.y==='') ){
+      const lat = klist.find(k=>/lat/i.test(k));
+      const lon = klist.find(k=>/(lon|lng)/i.test(k));
+      if(lat && lon){ out.x = Number(r[lon]); out.y = Number(r[lat]); }
+    }
+    // roll/pitch/yaw
+    ['roll','pitch','yaw'].forEach(name=>{
+      const k = klist.find(k=> new RegExp(name,'i').test(k));
+      if(k && isNumberString(r[k])) out[name]=Number(r[k]);
+    });
+    norm.push(out);
+  });
+
+  // produce CSV
+  const header = ['timestamp','x','y','z','roll','pitch','yaw'];
+  const csv = [header.join(',')].concat(norm.map(o=> header.map(h=> (o[h]===''?'' : String(o[h]))).join(','))).join('\n');
+
+  return {report:reportLines.join('\n'),csv:csv,sampleNorm:norm.slice(0,5)};
+}
+
+analyze.addEventListener('click', ()=>{
+  const parsed = parseInput(input.value);
+  const result = analyzeData(parsed);
+  if(result.error){ report.textContent = 'Error: '+result.error; output.textContent='—'; return; }
+  report.textContent = result.report + '\n\nSample normalized rows (first 5):\n' + JSON.stringify(result.sampleNorm,null,2);
+  output.textContent = result.csv;
+});
+</script>
+</body>
+</html>
